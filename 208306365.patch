@@ -1,0 +1,343 @@
+diff --git a/Makefile b/Makefile
+index 328f9c6..e9a30cb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,8 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++  $K/cas.o
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+diff --git a/kernel/cas.S b/kernel/cas.S
+new file mode 100644
+index 0000000..01fedba
+--- /dev/null
++++ b/kernel/cas.S
+@@ -0,0 +1,9 @@
++.global cas
++cas:
++    lr.w t0,(a0)
++    bne t0, a1, fail
++    sc.w a0,a2,(a0)
++    jr ra
++fail:
++    li a0,1
++    jr ra
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..ebb91be 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,9 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++int             pysPgIndex(uint64 pa);
++void            casCowInc(uint64 pgIdx);
++void            casCowDec(uint64 pgIdx);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -145,6 +148,7 @@ void            trapinit(void);
+ void            trapinithart(void);
+ extern struct spinlock tickslock;
+ void            usertrapret(void);
++int             cow_pgfault_handle(pagetable_t pt,uint64 va);
+ 
+ // uart.c
+ void            uartinit(void);
+@@ -170,6 +174,7 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++pte_t *         walk(pagetable_t pagetable, uint64 va, int alloc);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..90ce5a5 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -8,6 +8,8 @@
+ #include "spinlock.h"
+ #include "riscv.h"
+ #include "defs.h"
++int pgc = 0; // page kalloc global counter
++int cow_arr[NUM_PYS_PAGES]; // initializing all references to cow-modified-pages to 0 
+ 
+ void freerange(void *pa_start, void *pa_end);
+ 
+@@ -27,6 +29,7 @@ void
+ kinit()
+ {
+   initlock(&kmem.lock, "kmem");
++  memset(cow_arr,0,sizeof(int)*NUM_PYS_PAGES);
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -39,6 +42,66 @@ freerange(void *pa_start, void *pa_end)
+     kfree(p);
+ }
+ 
++
++
++extern uint64 cas(volatile void* addr, int expected, int newval );
++
++// Return the index of physical page table in the pagetable array, returns -1 on failure ****************************FIX THIS phyws address calc needed
++int pysPgIndex(uint64 pa){
++  if(pa >= MAXVA ||pa < KERNBASE) // unbound addr
++    return -1;
++  int pgIdx= (pa - KERNBASE)/PGSIZE;
++  //printf("test pyspgindex  %d cow Inc in arr[%d] , curr pgc is : %d \n ",1,pgIdx,pgc);
++  if(pgIdx>NUM_PYS_PAGES|| pgIdx<0){ // sanity check 
++     printf("test incrementing in cow arr out of bound ! adress invalid, cow Inc in arr[%d] \n ",pgIdx);
++  }
++  //printf("test cow pys page index in array : %d ,  \n ",pgIdx);
++  return pgIdx;
++}
++// incrementing cow counter 
++void  casCowInc(uint64 pgIdx){
++   // printf("test  %d cow Inc in arr[%d] , curr pgc is : %d \n ",1,pgIdx,pgc);
++    if(pysPgIndex(pgIdx)==-1){
++      printf("page index out of bound \n");
++    }
++  int old;
++  do{
++    old = cow_arr[pysPgIndex(pgIdx)];
++  }while(cas(&cow_arr[pysPgIndex(pgIdx)],old,old+1));
++   // printf("test  %d cow Inc \n ",2);
++}
++// decrement cow counter 
++void  casCowDec(uint64 pgIdx){
++ // printf("test  %d cow dec \n ",1);
++   if(pysPgIndex(pgIdx)==-1){
++      printf("page index out of bound \n");
++    }
++  int old;
++  do{
++    old = cow_arr[pysPgIndex(pgIdx)];
++  }while(cas(&cow_arr[pysPgIndex(pgIdx)],old,old-1));
++    //printf("test  %d cow dec \n ",2);
++}
++// incrementing pgc counter 
++void pgcInc(){
++  int old;
++  do{
++    old = pgc;
++  }while(cas(&pgc,old,old+1));
++}
++// decrement pgc counter 
++void  pgcDec(){
++  int old;
++  do{
++    old = pgc;
++  }while(cas(&pgc,old,old-1));
++}
++
++int casCowFind(uint64 pgIdx){
++  return cow_arr[pysPgIndex(pgIdx)];
++}
++
++
+ // Free the page of physical memory pointed at by v,
+ // which normally should have been returned by a
+ // call to kalloc().  (The exception is when
+@@ -51,6 +114,11 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  casCowDec((uint64)pa);
++  if(cow_arr[pysPgIndex((uint64)pa)]>0){ // This is the last PTE pointing at this page 
++    return;
++  }
++   cow_arr[pysPgIndex((uint64)pa)]=0;
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -60,6 +128,7 @@ kfree(void *pa)
+   r->next = kmem.freelist;
+   kmem.freelist = r;
+   release(&kmem.lock);
++
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -69,11 +138,12 @@ void *
+ kalloc(void)
+ {
+   struct run *r;
+-
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r){
++    cow_arr[pysPgIndex((uint64)r)]=1;
+     kmem.freelist = r->next;
++  }
+   release(&kmem.lock);
+ 
+   if(r)
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..b6ebb2b 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -344,6 +344,9 @@ sfence_vma()
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
+ 
++#define PTE_COW (1L << 9) // copy-on-write
++#define NUM_PYS_PAGES ((PHYSTOP-KERNBASE)/PGSIZE)
++
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..8fcc10d 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -28,7 +28,34 @@ trapinithart(void)
+ {
+   w_stvec((uint64)kernelvec);
+ }
++// handling page faults caused by cow
++int cow_pgfault_handle(pagetable_t pt,uint64 va){
+ 
++  va = PGROUNDDOWN(va);
++
++  if( va >= MAXVA){
++    return -1;
++  }
++
++  pte_t *pte;
++  if(((pte = walk(pt, va, 0))) == 0)
++        return -1;
++  if((*pte & PTE_V)==0)
++    return -1;
++  if((*pte & PTE_COW)==0)
++    return 1;
++  char *new_add;
++  if((new_add= kalloc())!=0){
++    uint64 pa = PTE2PA(*pte);
++    memmove(new_add,(char*)pa,PGSIZE);
++    *pte = PA2PTE(new_add) |((PTE_FLAGS(*pte) & ~PTE_COW)| PTE_W);
++    kfree((void*)pa);
++    return 0;
++  }
++  else{
++    return -1;
++  }
++}
+ //
+ // handle an interrupt, exception, or system call from user space.
+ // called from trampoline.S
+@@ -49,7 +76,7 @@ usertrap(void)
+   
+   // save user program counter.
+   p->trapframe->epc = r_sepc();
+-  
++
+   if(r_scause() == 8){
+     // system call
+ 
+@@ -65,6 +92,10 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++  } else if(r_scause() == 13 || r_scause() == 15 ){ //COW -PF handling 
++    uint64 va= r_stval();
++    if(va >= p->sz || cow_pgfault_handle(p->pagetable,va)!=0)
++      p->killed =1;
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..b48c34b 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -291,6 +291,9 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+   freewalk(pagetable);
+ }
+ 
++
++
++
+ // Given a parent process's page table, copy
+ // its memory into a child's page table.
+ // Copies both the page table and the
+@@ -299,7 +302,8 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+ // frees any allocated pages on failure.
+ int
+ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+-{
++{//ORIGINAL 
++/*
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+@@ -321,9 +325,29 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+     }
+   }
+   return 0;
+-
++*/
++// COW modified 
++  pte_t *pte;
++  uint64 pa, va;
++  for(va= 0; va < sz; va += PGSIZE){
++    if((pte = walk(old, va, 0)) == 0)
++      panic("uvmcopy: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmcopy: page not present");
++    pa = PTE2PA(*pte);
++    //printf(" uvmcopy curr pa %x \n",pa);
++    if(*pte & PTE_W){
++    *pte =(*pte|PTE_COW) & ~PTE_W; // COW flag on , W flag off
++    }
++    if(mappages(new, va, PGSIZE, pa, PTE_FLAGS(*pte)) != 0){
++      goto err;
++    }
++    // increment of cow counter sharing page with child caused by fork
++    casCowInc(pa);
++  }
++  return 0;
+  err:
+-  uvmunmap(new, 0, i / PGSIZE, 1);
++  uvmunmap(new, 0, va / PGSIZE, 1);
+   return -1;
+ }
+ 
+@@ -340,6 +364,7 @@ uvmclear(pagetable_t pagetable, uint64 va)
+   *pte &= ~PTE_U;
+ }
+ 
++
+ // Copy from kernel to user.
+ // Copy len bytes from src to virtual address dstva in a given page table.
+ // Return 0 on success, -1 on error.
+@@ -350,9 +375,21 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
++      if((cow_pgfault_handle(pagetable,va0))<0){ // cow-related-page
++         return -1;
++        }
+     pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
+-      return -1;
++    if(pa0 == 0){
++      pte_t *pte;
++      if((pte = walk(pagetable, 0, 0)) == 0)
++      panic("copyout: pte should exist");
++      
++        else{
++          return -1;
++        }
++        pa0= walkaddr(pagetable,va0);
++    }
++      
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+       n = len;
